@@ -1,4 +1,3 @@
-// go-mtcp/mtcp/mtcp.go
 package mtcp
 
 import (
@@ -8,11 +7,11 @@ import (
 	"io"
 	"log"
 	"net"
-	"os" // ADDED: For os.ErrDeadlineExceeded
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe" // ADDED: For atomic CAS on the CID
+	"unsafe"
 )
 
 const (
@@ -137,7 +136,6 @@ func (ms *MSocket) Connect(address string, hosts []string) error {
 
 // addConn adds a successfully handshaked net.Conn to the MSocket's pool.
 func (ms *MSocket) addConn(conn net.Conn) {
-	// CHANGED: Type assert to *net.TCPConn to access TCP-specific methods.
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(10 * time.Second)
@@ -157,7 +155,6 @@ func (ms *MSocket) handleConnRead(conn net.Conn) {
 	defer ms.wg.Done()
 	defer ms.removeConn(conn)
 
-	// CHANGED: removed unused 'header' variable.
 	var leftover []byte
 
 	for {
@@ -173,7 +170,6 @@ func (ms *MSocket) handleConnRead(conn net.Conn) {
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := conn.Read(readBuf)
 		if err != nil {
-			// CHANGED: Correctly check for os.ErrDeadlineExceeded
 			if err != io.EOF && !errors.Is(err, net.ErrClosed) && !errors.Is(err, os.ErrDeadlineExceeded) {
 				log.Printf("Read error on sub-connection: %v", err)
 			}
@@ -306,9 +302,16 @@ func (ms *MSocket) Write(p []byte) (n int, err error) {
 		conn := ms.conns[int(pid)%len(ms.conns)]
 		ms.connsMutex.RUnlock()
 
+		// CHANGED: Set a write deadline to prevent indefinite blocking
+		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		_, err := conn.Write(packetBuf)
+		conn.SetWriteDeadline(time.Time{}) // Clear the deadline
+
 		if err != nil {
 			log.Printf("Write error on sub-connection: %v", err)
+			// Don't just return. The connection might be dead, so remove it and try again if possible,
+			// but for now, returning the error is the simplest robust behavior.
+			ms.removeConn(conn) // Actively remove the failed connection
 			return totalWritten, err
 		}
 
@@ -390,7 +393,7 @@ func (l *MTcpListener) run() {
 	var nextCID uint32 = 1
 
 	for {
-		conn, err := l.tcpListener.Accept()
+		conn, err := l.tcpListener.AcceptTCP() // AcceptTCP to get *net.TCPConn
 		if err != nil {
 			select {
 			case <-l.closeCh:
@@ -414,6 +417,13 @@ func (l *MTcpListener) run() {
 func (l *MTcpListener) handleInitialConn(conn net.Conn, cid uint16) {
 	defer l.wg.Done()
 
+	// CHANGED: Set KeepAlive on server side to prevent idle timeout
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(10 * time.Second)
+		tcpConn.SetNoDelay(true)
+	}
+
 	cidBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(cidBuf, cid)
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -421,6 +431,7 @@ func (l *MTcpListener) handleInitialConn(conn net.Conn, cid uint16) {
 		conn.Close()
 		return
 	}
+	conn.SetWriteDeadline(time.Time{}) // Clear deadline
 
 	handshakeBuf := make([]byte, 4)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -441,22 +452,19 @@ func (l *MTcpListener) handleInitialConn(conn net.Conn, cid uint16) {
 	l.pendingMux.Lock()
 	connChan, exists := l.pending[masterID]
 	if !exists {
-		ms := NewMSocket(0)
+		// This is the first connection for this masterID. Create a new MSocket.
+		ms := NewMSocket(0) // poolCount is irrelevant on server-side MSocket
 		ms.cid = masterID
 		ms.readyState.Store("open")
-		
-		// Create a channel for subsequent connections for this masterID
+
 		newConnChan := make(chan net.Conn, 16)
-		l.pending[masterID] = newConnChan
-		l.pendingMux.Unlock() // Unlock before potentially blocking operations
 
-		ms.addConn(conn)
-
-		// Goroutine to add subsequent connections to the newly created MSocket
+		// CHANGED: Fix race condition. Start the consumer goroutine BEFORE publishing the channel.
 		l.wg.Add(1)
 		go func(m *MSocket, ch chan net.Conn) {
 			defer l.wg.Done()
 			defer func() {
+				// Clean up the pending map when the MSocket is closed
 				l.pendingMux.Lock()
 				delete(l.pending, m.cid)
 				l.pendingMux.Unlock()
@@ -464,6 +472,9 @@ func (l *MTcpListener) handleInitialConn(conn net.Conn, cid uint16) {
 			for {
 				select {
 				case newConn := <-ch:
+					if newConn == nil { // Channel closed
+						return
+					}
 					m.addConn(newConn)
 				case <-m.closeCh:
 					return
@@ -473,7 +484,14 @@ func (l *MTcpListener) handleInitialConn(conn net.Conn, cid uint16) {
 			}
 		}(ms, newConnChan)
 
-		// The new MSocket is ready to be accepted
+		// Now, it's safe to publish the channel to the map.
+		l.pending[masterID] = newConnChan
+		l.pendingMux.Unlock() // Unlock *after* the state is consistent.
+
+		// Add the first connection to the new MSocket.
+		ms.addConn(conn)
+
+		// The new MSocket is ready to be accepted by the application.
 		select {
 		case l.acceptCh <- ms:
 		case <-l.closeCh:
@@ -482,10 +500,14 @@ func (l *MTcpListener) handleInitialConn(conn net.Conn, cid uint16) {
 		}
 
 	} else {
+		// This connection belongs to an existing MSocket.
 		l.pendingMux.Unlock()
 		select {
 		case connChan <- conn:
+			// Successfully sent to the consumer goroutine.
 		case <-time.After(5 * time.Second):
+			// The consumer didn't pick it up in time, which is an error state.
+			log.Printf("Timeout sending sub-connection to existing MSocket (CID: %d). Closing connection.", masterID)
 			conn.Close()
 		}
 	}
