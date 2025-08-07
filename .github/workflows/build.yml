@@ -1,24 +1,21 @@
-# .github/workflows/build.yml
+# 工作流名称
+name: Go Cross-Compilation Build
 
-name: Golang 跨平台构建
-
+# 工作流触发器
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main" ] # 当 main 分支有 push 时触发
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "main" ] # 当有 pull request 到 main 分支时触发
+  workflow_dispatch:      # 允许手动从 Actions 页面触发
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }} (${{ matrix.target }})
-    runs-on: ubuntu-latest # 所有平台都可以在 ubuntu-latest 上交叉编译，以节省资源
-
+    # 使用矩阵策略 (matrix strategy) 为每个平台并行运行一个 job
     strategy:
-      # fail-fast: false 可以让一个任务失败后，其他矩阵中的任务继续运行
-      fail-fast: false
       matrix:
-        include:
-          # --- 现有平台 ---
+        platform:
+          # --- 您的平台列表 ---
           - goos: linux
             goarch: amd64
             target: linux-amd64
@@ -47,39 +44,57 @@ jobs:
             goarm: '7' # 指定 ARM 版本为 v7
             target: android-armv7
 
+    # 每个 job 的名称，会显示在 GitHub Actions UI 中
+    name: Build for ${{ matrix.platform.target }}
+    # 指定运行环境，ubuntu-latest 是最通用且经济的选择
+    runs-on: ubuntu-latest
+
     steps:
-      - name: 检出代码
+      # 第一步：检出您的代码
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: 设置 Go 环境
-        uses: actions/setup-go@v5
+      # 第二步：设置 Go 环境
+      - name: Set up Go
+        uses: actions/setup-go@v4
         with:
-          go-version: '1.22.x'
+          go-version: '1.21.x' # 您可以指定需要的 Go 版本
 
-      - name: 构建
+      # 第三步：执行交叉编译
+      - name: Build
+        # 设置环境变量，go build 命令会读取这些变量来决定目标平台
+        env:
+          GOOS: ${{ matrix.platform.goos }}
+          GOARCH: ${{ matrix.platform.goarch }}
+          GOARM: ${{ matrix.platform.goarm }} # 如果矩阵中没有定义 goarm，这里会是空字符串，Go 会忽略它
         run: |
-          # 定义需要构建的应用程序目录列表
-          APPS="client pipeserver remote"
+          # 定义你的二进制文件基础名称
+          BINARY_NAME="mtcp-tunnel"
           
-          # 创建存放构建结果的目录
-          OUTPUT_DIR="dist"
-          mkdir -p $OUTPUT_DIR
-
-          # 准备环境变量字符串
-          BUILD_ENV="GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}"
-          # 如果 goarm 变量被定义了，就添加到环境变量中
-          if [[ -n "${{ matrix.goarm }}" ]]; then
-            BUILD_ENV="$BUILD_ENV GOARM=${{ matrix.goarm }}"
+          # 根据目标平台生成输出文件名 (例如: my-app-linux-amd64)
+          OUTPUT_NAME="${BINARY_NAME}-${{ matrix.platform.target }}"
+          
+          # 如果是 Windows 平台，添加 .exe 后缀
+          if [ "${{ matrix.platform.goos }}" = "windows" ]; then
+            OUTPUT_NAME+=".exe"
           fi
+          
+          echo "Building for ${{ matrix.platform.target }} -> ${OUTPUT_NAME}"
+          
+          # 执行编译命令
+          # -v: 打印被编译的包名
+          # -ldflags="-s -w": 优化二进制文件大小 (-s 去除符号表, -w 去除 DWARF 调试信息)
+          # -o: 指定输出文件名
+          go build -v -ldflags="-s -w" -o "${OUTPUT_NAME}" main.go
 
-          for app in $APPS; do
-            echo "==> Building $app for ${{ matrix.target }}"
-            
-            # 为 Windows 系统添加 .exe 后缀
-            BINARY_NAME="$app-${{ matrix.target }}"
-            if [ "${{ matrix.goos }}" = "windows" ]; then
-              BINARY_NAME="$BINARY_NAME.exe"
-            fi
+      # 第四步：上传编译好的二进制文件作为构件
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # 构件的名称，会显示在 Actions 总结页面
+          name: ${{ matrix.platform.target }}-binary
+          # 要上传的文件路径，使用通配符 * 可以匹配带 .exe 后缀和不带后缀的文件
+          path: mtcp-tunnel-${{ matrix.platform.target }}*            fi
             
             # 使用准备好的环境变量进行交叉编译
             # -v: 打印编译的包名
