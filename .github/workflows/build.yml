@@ -1,0 +1,95 @@
+# .github/workflows/build.yml
+
+# Workflow 的名称，会显示在 GitHub Actions 的界面上
+name: Golang 跨平台构建
+
+# 触发 Workflow 的事件
+on:
+  push:
+    # 只在 main 或 master 分支有 push 事件时触发
+    branches: [ "main", "master" ]
+  pull_request:
+    # 在针对 main 或 master 分支的 pull request 事件时也触发
+    branches: [ "main", "master" ]
+
+# 定义一系列要运行的任务
+jobs:
+  # 定义一个名为 'build' 的任务
+  build:
+    # 定义任务的名称，支持使用矩阵变量
+    name: Build for ${{ matrix.os }} (${{ matrix.goarch }})
+    # 指定任务运行的虚拟环境
+    runs-on: ${{ matrix.os }}
+
+    # 定义构建矩阵，用于实现交叉编译
+    strategy:
+      matrix:
+        # 定义要编译的目标平台和架构组合
+        include:
+          - goos: linux
+            goarch: amd64
+            os: ubuntu-latest
+          - goos: windows
+            goarch: amd64
+            os: windows-latest
+          - goos: darwin # macOS
+            goarch: amd64
+            os: macos-latest
+          - goos: darwin # macOS Apple Silicon
+            goarch: arm64
+            os: macos-latest
+
+    # 任务的执行步骤
+    steps:
+      # 步骤1：检出代码
+      # 使用官方的 checkout action 来获取仓库代码
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 步骤2：设置 Go 环境
+      # 使用官方的 setup-go action 来安装和配置指定版本的 Go
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x' # 您可以根据需要更改 Go 版本
+
+      # 步骤3：下载 Go 模块依赖
+      - name: 下载依赖
+        run: go mod download
+
+      # 步骤4：构建应用程序
+      # 这个步骤会遍历所有需要构建的入口程序
+      - name: 构建
+        run: |
+          # 定义需要构建的应用程序目录列表
+          APPS="client pipeserver remote"
+          
+          # 创建存放构建结果的目录
+          OUTPUT_DIR="dist"
+          mkdir -p $OUTPUT_DIR
+
+          for app in $APPS; do
+            echo "==> Building $app for ${{ matrix.goos }}/${{ matrix.goarch }}"
+            
+            # 为 Windows 系统添加 .exe 后缀
+            BINARY_NAME="$app-${{ matrix.goos }}-${{ matrix.goarch }}"
+            if [ "${{ matrix.goos }}" = "windows" ]; then
+              BINARY_NAME="$BINARY_NAME.exe"
+            fi
+            
+            # 设置 GOOS 和 GOARCH 环境变量进行交叉编译
+            # -v: 打印编译的包名
+            # -ldflags="-s -w": 减小二进制文件大小 (可选)
+            # -o: 指定输出路径和文件名
+            env GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -v -ldflags="-s -w" -o "${OUTPUT_DIR}/${BINARY_NAME}" "./${app}"
+          done
+
+      # 步骤5：上传构建产物
+      # 将 'dist' 目录下的所有文件打包成一个 artifact
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          # artifact 的名称，使用平台和架构命名以作区分
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          # 要上传的路径
+          path: dist/
