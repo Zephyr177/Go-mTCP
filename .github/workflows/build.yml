@@ -13,6 +13,7 @@ jobs:
   build:
     # 使用矩阵策略 (matrix strategy) 为每个平台并行运行一个 job
     strategy:
+      fail-fast: false # 设置为 false，即使一个 job 失败，其他 job 也会继续运行
       matrix:
         platform:
           # --- 您的平台列表 ---
@@ -68,7 +69,7 @@ jobs:
           GOARCH: ${{ matrix.platform.goarch }}
           GOARM: ${{ matrix.platform.goarm }} # 如果矩阵中没有定义 goarm，这里会是空字符串，Go 会忽略它
         run: |
-          # 定义你的二进制文件基础名称
+          # 定义你的二进制文件基础名称 (请修改为你自己的)
           BINARY_NAME="mtcp-tunnel"
           
           # 根据目标平台生成输出文件名 (例如: my-app-linux-amd64)
@@ -94,18 +95,4 @@ jobs:
           # 构件的名称，会显示在 Actions 总结页面
           name: ${{ matrix.platform.target }}-binary
           # 要上传的文件路径，使用通配符 * 可以匹配带 .exe 后缀和不带后缀的文件
-          path: mtcp-tunnel-${{ matrix.platform.target }}*            fi
-            
-            # 使用准备好的环境变量进行交叉编译
-            # -v: 打印编译的包名
-            # -ldflags="-s -w": 减小二进制文件大小
-            # -o: 指定输出路径和文件名
-            env $BUILD_ENV go build -v -ldflags="-s -w" -o "${OUTPUT_DIR}/${BINARY_NAME}" "./${app}"
-          done
-
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v4
-        with:
-          # artifact 的名称，使用 target 命名以作区分
-          name: binaries-${{ matrix.target }}
-          path: dist/
+          path: mtcp-tunnel-${{ matrix.platform.target }}*
