@@ -17,21 +17,19 @@ import (
 )
 
 const (
-	mtcpHeaderLength   = 4     // 2 bytes for length, 2 bytes for packet id
-	mtcpMaxPayloadSize = 65535 // Max size for a TCP payload in our protocol
-	debugLogEnabled    = false // Enable for verbose logging
+	mtcpHeaderLength   = 4
+	mtcpMaxPayloadSize = 65535
+	debugLogEnabled    = false
 )
 
 //================================================================================
 // MTCP 核心实现 (MSocket)
 //================================================================================
-
-// MSocket represents a multiplexed TCP connection.
 type MSocket struct {
 	io.ReadWriteCloser
 	poolCount   int
 	remoteAddrs []string
-	cid         uint16 // Master connection ID, assigned by the server
+	cid         uint16
 	isServer    bool
 	conns       []*mSubConn
 	connsMutex  sync.RWMutex
@@ -45,17 +43,15 @@ type MSocket struct {
 	cancel      context.CancelFunc
 	closeOnce   sync.Once
 	wg          sync.WaitGroup
-	readyState  string // "opening", "open", "closed"
+	readyState  string
 }
 
-// mSubConn represents a single underlying TCP connection for an MSocket.
 type mSubConn struct {
 	net.Conn
-	cid uint16 // Sub-connection ID, unique per sub-connection
-	mid uint16 // Master connection ID, same for all sub-conns of an MSocket
+	cid uint16
+	mid uint16
 }
 
-// NewMSocketClient creates a new client-side MSocket.
 func NewMSocketClient(addrs []string, poolCount int) *MSocket {
 	ctx, cancel := context.WithCancel(context.Background())
 	ms := &MSocket{
@@ -71,7 +67,6 @@ func NewMSocketClient(addrs []string, poolCount int) *MSocket {
 	return ms
 }
 
-// NewMSocketServer creates a new server-side MSocket.
 func NewMSocketServer(mid uint16) *MSocket {
 	ctx, cancel := context.WithCancel(context.Background())
 	ms := &MSocket{
@@ -81,23 +76,23 @@ func NewMSocketServer(mid uint16) *MSocket {
 		readChan:   make(chan []byte, 1024),
 		ctx:        ctx,
 		cancel:     cancel,
-		readyState: "open", // Server-side is considered open immediately
+		readyState: "open",
 	}
 	return ms
 }
 
-// Connect establishes the sub-connections for a client MSocket.
-// This function is asynchronous and returns immediately.
+// Connect (FIXED): Made blocking until the first sub-connection is established or a timeout occurs.
 func (ms *MSocket) Connect() error {
 	if ms.isServer {
 		return errors.New("Connect() should only be called by a client MSocket")
 	}
 
-	if len(ms.remoteAddrs) == 0 {
+	if len(ms.remoteAddrs) > 1 {
+		ms.poolCount = len(ms.remoteAddrs)
+	} else if len(ms.remoteAddrs) == 0 {
 		return errors.New("no remote address specified")
 	}
 
-	// If only one address is given but poolCount > 1, duplicate the address
 	targetAddrs := ms.remoteAddrs
 	if len(targetAddrs) == 1 && ms.poolCount > 1 {
 		for i := 1; i < ms.poolCount; i++ {
@@ -106,75 +101,76 @@ func (ms *MSocket) Connect() error {
 	}
 
 	var firstConnOnce sync.Once
+	connectors := &sync.WaitGroup{}
+	connectors.Add(len(targetAddrs))
+	successChan := make(chan struct{}, 1) // Channel to signal first successful connection
+
 	for _, addr := range targetAddrs {
-		go ms.connectSub(addr, &firstConnOnce)
-	}
+		go func(address string) {
+			defer connectors.Done()
+			for {
+				select {
+				case <-ms.ctx.Done():
+					return
+				default:
+				}
 
-	return nil
-}
+				if debugLogEnabled {
+					log.Printf("[MSocket DEBUG] Dialing sub-connection to %s...", address)
+				}
+				conn, err := net.DialTimeout("tcp", address, 10*time.Second)
+				if err != nil {
+					log.Printf("[MSocket WARN] Failed to dial sub-connection to %s: %v. Retrying in 5s...", address, err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
 
-// connectSub handles the connection loop for a single sub-connection.
-func (ms *MSocket) connectSub(address string, firstConnOnce *sync.Once) {
-	for {
-		select {
-		case <-ms.ctx.Done():
-			return
-		default:
-		}
+				if err := ms.handshakeClient(conn); err != nil {
+					log.Printf("[MSocket WARN] Handshake failed for %s: %v", address, err)
+					conn.Close()
+					time.Sleep(5 * time.Second)
+					continue
+				}
 
-		if debugLogEnabled {
-			log.Printf("[MSocket DEBUG] Dialing sub-connection to %s...", address)
-		}
-		conn, err := net.DialTimeout("tcp", address, 10*time.Second)
-		if err != nil {
-			log.Printf("main.go:121: [MSocket WARN] Failed to dial sub-connection to %s: %v. Retrying in 5s...", address, err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		if err := ms.handshakeClient(conn); err != nil {
-			log.Printf("[MSocket WARN] Handshake failed for %s: %v. Retrying in 5s...", address, err)
-			conn.Close()
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		// After the first successful sub-connection, the MSocket is considered "open".
-		firstConnOnce.Do(func() {
-			ms.readyState = "open"
-			if debugLogEnabled {
-				log.Printf("[MSocket DEBUG] MSocket (id: %d) is now open.", ms.cid)
+				firstConnOnce.Do(func() {
+					ms.readyState = "open"
+					if debugLogEnabled {
+						log.Printf("[MSocket DEBUG] MSocket (id: %d) is now open.", ms.cid)
+					}
+					close(successChan) // Signal success
+				})
+				return // This goroutine's job is done
 			}
-		})
+		}(addr)
+	}
 
-		// This sub-connection is now established and handled by its readLoop.
-		// If it disconnects, the readLoop will exit, and this `connectSub`
-		// function will loop to try and reconnect.
-		return
+	// Block until the first connection succeeds or we time out
+	select {
+	case <-successChan:
+		return nil // At least one connection was successful
+	case <-time.After(20 * time.Second): // Global timeout for connecting
+		ms.Close() // Clean up on timeout
+		return errors.New("msocket connect timed out, no sub-connection was established")
 	}
 }
 
-// handshakeClient performs the client-side handshake for a new sub-connection.
 func (ms *MSocket) handshakeClient(conn net.Conn) error {
 	var serverCid uint16
-	// 1. Read the unique sub-connection ID from the server
 	if err := binary.Read(conn, binary.BigEndian, &serverCid); err != nil {
 		return fmt.Errorf("reading server cid: %w", err)
 	}
 	subConn := &mSubConn{Conn: conn, cid: serverCid}
 
 	ms.connsMutex.Lock()
-	// 2. The first sub-connection establishes the master ID for the MSocket
 	if ms.cid == 0 {
 		ms.cid = serverCid
 	}
 	subConn.mid = ms.cid
 	ms.connsMutex.Unlock()
 
-	// 3. Send back verification info
 	buf := make([]byte, 4)
-	binary.BigEndian.PutUint16(buf[0:2], subConn.cid+100) // Verification
-	binary.BigEndian.PutUint16(buf[2:4], subConn.mid)     // Master ID
+	binary.BigEndian.PutUint16(buf[0:2], subConn.cid+100)
+	binary.BigEndian.PutUint16(buf[2:4], subConn.mid)
 	if _, err := conn.Write(buf); err != nil {
 		return fmt.Errorf("writing client info: %w", err)
 	}
@@ -186,7 +182,6 @@ func (ms *MSocket) handshakeClient(conn net.Conn) error {
 	return nil
 }
 
-// addSubConn adds a new sub-connection to the MSocket and starts its read loop.
 func (ms *MSocket) addSubConn(subConn *mSubConn) {
 	ms.connsMutex.Lock()
 	ms.conns = append(ms.conns, subConn)
@@ -199,24 +194,15 @@ func (ms *MSocket) addSubConn(subConn *mSubConn) {
 	}()
 }
 
-// readLoop reads data from a sub-connection and reassembles it in order.
 func (ms *MSocket) readLoop(subConn *mSubConn) {
 	defer func() {
-		subConn.Close()
 		ms.connsMutex.Lock()
-		
-		// BUG修复：在从 ms.conns 移除断开的连接时，必须处理并发场景。
-		// 直接遍历并构建一个新的切片是最安全的方式，可以避免在 len(ms.conns) 为0或1时，
-		// 计算 newConns 容量 (len-1) 时出现负数，从而引发 panic。
-		newConns := make([]*mSubConn, 0, len(ms.conns))
-		for _, c := range ms.conns {
-			if c != subConn {
-				newConns = append(newConns, c)
+		for i, c := range ms.conns {
+			if c == subConn {
+				ms.conns = append(ms.conns[:i], ms.conns[i+1:]...)
+				break
 			}
 		}
-		ms.conns = newConns
-
-		// If this was the last sub-connection, close the entire MSocket
 		if len(ms.conns) == 0 {
 			if debugLogEnabled {
 				log.Printf("[MSocket DEBUG] All sub-connections for MSocket %d are closed. Closing MSocket.", ms.cid)
@@ -224,12 +210,7 @@ func (ms *MSocket) readLoop(subConn *mSubConn) {
 			ms.Close()
 		}
 		ms.connsMutex.Unlock()
-
-		// For clients, try to reconnect this sub-connection
-		if !ms.isServer {
-			var firstConnOnce sync.Once // Dummy, as MSocket is already open
-			go ms.connectSub(subConn.RemoteAddr().String(), &firstConnOnce)
-		}
+		subConn.Close()
 	}()
 
 	reader := bufio.NewReader(subConn)
@@ -240,7 +221,6 @@ func (ms *MSocket) readLoop(subConn *mSubConn) {
 		case <-ms.ctx.Done():
 			return
 		default:
-			// Read header: 2 bytes length, 2 bytes packet ID
 			_, err := io.ReadFull(reader, header)
 			if err != nil {
 				if err != io.EOF && !errors.Is(err, net.ErrClosed) {
@@ -248,18 +228,9 @@ func (ms *MSocket) readLoop(subConn *mSubConn) {
 				}
 				return
 			}
-
-			// [FIX] Simplified length handling
 			length := binary.BigEndian.Uint16(header[0:2])
 			pid := binary.BigEndian.Uint16(header[2:4])
-
-			if length > mtcpMaxPayloadSize {
-				log.Printf("[MSocket ERROR] Invalid payload length received: %d", length)
-				return
-			}
-			payload := make([]byte, length)
-
-			// Read payload
+			payload := make([]byte, length+1)
 			_, err = io.ReadFull(reader, payload)
 			if err != nil {
 				if err != io.EOF && !errors.Is(err, net.ErrClosed) {
@@ -267,14 +238,12 @@ func (ms *MSocket) readLoop(subConn *mSubConn) {
 				}
 				return
 			}
-
-			// Reassemble packets in order
 			ms.readMutex.Lock()
 			ms.packages[pid] = payload
 			for {
 				data, ok := ms.packages[ms.readPid]
 				if !ok {
-					break // Next packet is not here yet, wait for it
+					break
 				}
 				delete(ms.packages, ms.readPid)
 				ms.readChan <- data
@@ -285,7 +254,6 @@ func (ms *MSocket) readLoop(subConn *mSubConn) {
 	}
 }
 
-// Read reads data from the reassembled stream.
 func (ms *MSocket) Read(p []byte) (n int, err error) {
 	select {
 	case <-ms.ctx.Done():
@@ -295,20 +263,16 @@ func (ms *MSocket) Read(p []byte) (n int, err error) {
 			return 0, io.EOF
 		}
 		n = copy(p, data)
-		// Note: If n < len(data), the user's buffer was too small. The rest of the data is lost.
-		// This is standard io.Reader behavior.
+		if n < len(data) {
+			log.Printf("[MSocket WARN] Read buffer is smaller than a single package. Data might be lost.")
+		}
 		return n, nil
 	}
 }
 
-// Write splits data into chunks and sends them over available sub-connections.
 func (ms *MSocket) Write(p []byte) (n int, err error) {
 	if ms.readyState != "open" {
-		// Wait a moment for the connection to potentially open
-		<-time.After(10 * time.Millisecond)
-		if ms.readyState != "open" {
-			return 0, errors.New("msocket is not open")
-		}
+		return 0, errors.New("msocket is not open")
 	}
 
 	ms.writeMutex.Lock()
@@ -328,8 +292,7 @@ func (ms *MSocket) Write(p []byte) (n int, err error) {
 		ms.writePid++
 
 		header := make([]byte, mtcpHeaderLength)
-		// [FIX] Simplified length handling
-		binary.BigEndian.PutUint16(header[0:2], uint16(len(chunk)))
+		binary.BigEndian.PutUint16(header[0:2], uint16(len(chunk)-1))
 		binary.BigEndian.PutUint16(header[2:4], pid)
 		packet := append(header, chunk...)
 
@@ -340,7 +303,6 @@ func (ms *MSocket) Write(p []byte) (n int, err error) {
 
 		_, err := conn.Write(packet)
 		if err != nil {
-			// This sub-connection might be dead. The readLoop will handle its removal.
 			return totalWritten, fmt.Errorf("write to sub-conn failed: %w", err)
 		}
 
@@ -351,7 +313,6 @@ func (ms *MSocket) Write(p []byte) (n int, err error) {
 	return totalWritten, nil
 }
 
-// selectSubConn picks a sub-connection to write to, using round-robin.
 func (ms *MSocket) selectSubConn() *mSubConn {
 	ms.connsMutex.RLock()
 	defer ms.connsMutex.RUnlock()
@@ -359,15 +320,13 @@ func (ms *MSocket) selectSubConn() *mSubConn {
 	if len(ms.conns) == 0 {
 		return nil
 	}
-	// Simple round-robin based on packet ID
-	return ms.conns[int(ms.writePid)%len(ms.conns)]
+	return ms.conns[ms.writePid%uint16(len(ms.conns))]
 }
 
-// Close gracefully shuts down the MSocket and all its sub-connections.
 func (ms *MSocket) Close() error {
 	ms.closeOnce.Do(func() {
 		ms.readyState = "closed"
-		ms.cancel() // Signal all goroutines to stop
+		ms.cancel()
 
 		ms.connsMutex.Lock()
 		for _, conn := range ms.conns {
@@ -379,13 +338,13 @@ func (ms *MSocket) Close() error {
 		ms.readMutex.Lock()
 		if ms.readChan != nil {
 			close(ms.readChan)
-			ms.readChan = nil // Prevent writing to closed channel
 			ms.packages = nil
 		}
 		ms.readMutex.Unlock()
 
-		// Wait for all goroutines (like readLoop) to finish
-		go ms.wg.Wait()
+		go func() {
+			ms.wg.Wait()
+		}()
 	})
 	return nil
 }
@@ -393,8 +352,6 @@ func (ms *MSocket) Close() error {
 //================================================================================
 // MTCP 服务端监听器
 //================================================================================
-
-// MTCPListener listens for incoming MSockets.
 type MTCPListener struct {
 	tcpListener *net.TCPListener
 	msockets    map[uint16]*MSocket
@@ -404,7 +361,6 @@ type MTCPListener struct {
 	cancel      context.CancelFunc
 }
 
-// ListenMTCP creates a new MTCP listener on a given address.
 func ListenMTCP(addr string) (*MTCPListener, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -425,10 +381,10 @@ func ListenMTCP(addr string) (*MTCPListener, error) {
 	}
 
 	go listener.start()
+
 	return listener, nil
 }
 
-// start is the main accept loop for the listener.
 func (l *MTCPListener) start() {
 	var tempCid uint16 = 1
 	log.Printf("MTCP server listening on %s", l.tcpListener.Addr())
@@ -438,86 +394,75 @@ func (l *MTCPListener) start() {
 		if err != nil {
 			select {
 			case <-l.ctx.Done():
-				return // Listener is closed
+				return
 			default:
 				log.Printf("[MTCP Listener] Accept error: %v", err)
 			}
 			continue
 		}
 
-		go l.handleIncomingSubConn(conn, tempCid)
-		tempCid++
-		if tempCid > 65000 {
-			tempCid = 1 // Wrap around
-		}
-	}
-}
-
-// handleIncomingSubConn performs the server-side handshake.
-func (l *MTCPListener) handleIncomingSubConn(tcpConn net.Conn, cid uint16) {
-	subConn := &mSubConn{Conn: tcpConn, cid: cid}
-
-	// 1. Send the unique sub-connection ID to the client
-	if err := binary.Write(tcpConn, binary.BigEndian, subConn.cid); err != nil {
-		log.Printf("[MTCP Listener] Failed to send cid to client: %v", err)
-		tcpConn.Close()
-		return
-	}
-
-	// 2. Read verification info from the client
-	buf := make([]byte, 4)
-	tcpConn.SetReadDeadline(time.Now().Add(10 * time.Second)) // Timeout for handshake
-	if _, err := io.ReadFull(tcpConn, buf); err != nil {
-		log.Printf("[MTCP Listener] Failed to read client info: %v", err)
-		tcpConn.Close()
-		return
-	}
-	tcpConn.SetReadDeadline(time.Time{}) // Clear deadline
-
-	// 3. Verify client response
-	remoteCidCheck := binary.BigEndian.Uint16(buf[0:2])
-	if remoteCidCheck != subConn.cid+100 {
-		log.Printf("[MTCP Listener] Client verification failed. Expected %d, got %d", subConn.cid+100, remoteCidCheck)
-		tcpConn.Close()
-		return
-	}
-
-	mid := binary.BigEndian.Uint16(buf[2:4])
-	subConn.mid = mid
-
-	// 4. Find or create the master MSocket
-	l.msocketsMux.Lock()
-	ms, exists := l.msockets[mid]
-	if !exists {
-		ms = NewMSocketServer(mid)
-		l.msockets[mid] = ms
-		select {
-		case l.acceptChan <- ms:
-			if debugLogEnabled {
-				log.Printf("[MTCP Listener DEBUG] New MSocket (id: %d) accepted.", mid)
+		go func(tcpConn net.Conn) {
+			subConn := &mSubConn{Conn: tcpConn, cid: tempCid}
+			tempCid++
+			if tempCid > 65000 {
+				tempCid = 1
 			}
-		case <-l.ctx.Done():
-			l.msocketsMux.Unlock()
-			ms.Close()
-			return
-		}
-		// Goroutine to clean up the MSocket from the map when it's closed
-		go func(id uint16) {
-			<-ms.ctx.Done()
+
+			if err := binary.Write(tcpConn, binary.BigEndian, subConn.cid); err != nil {
+				log.Printf("[MTCP Listener] Failed to send cid to client: %v", err)
+				tcpConn.Close()
+				return
+			}
+
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(tcpConn, buf); err != nil {
+				log.Printf("[MTCP Listener] Failed to read client info: %v", err)
+				tcpConn.Close()
+				return
+			}
+
+			remoteCidCheck := binary.BigEndian.Uint16(buf[0:2])
+			if remoteCidCheck != subConn.cid+100 {
+				log.Printf("[MTCP Listener] Client verification failed. Expected %d, got %d", subConn.cid+100, remoteCidCheck)
+				tcpConn.Close()
+				return
+			}
+
+			mid := binary.BigEndian.Uint16(buf[2:4])
+			subConn.mid = mid
+
 			l.msocketsMux.Lock()
-			delete(l.msockets, id)
-			l.msocketsMux.Unlock()
-			if debugLogEnabled {
-				log.Printf("[MTCP Listener DEBUG] MSocket (id: %d) closed and removed.", id)
+			ms, exists := l.msockets[mid]
+			if !exists {
+				ms = NewMSocketServer(mid)
+				l.msockets[mid] = ms
+				select {
+				case l.acceptChan <- ms:
+					if debugLogEnabled {
+						log.Printf("[MTCP Listener DEBUG] New MSocket (id: %d) accepted.", mid)
+					}
+				case <-l.ctx.Done():
+					l.msocketsMux.Unlock()
+					return
+				}
+				go func(id uint16) {
+					<-ms.ctx.Done()
+					l.msocketsMux.Lock()
+					delete(l.msockets, id)
+					l.msocketsMux.Unlock()
+					if debugLogEnabled {
+						log.Printf("[MTCP Listener DEBUG] MSocket (id: %d) closed and removed.", id)
+					}
+				}(mid)
 			}
-		}(mid)
-	}
-	l.msocketsMux.Unlock()
+			l.msocketsMux.Unlock()
 
-	ms.addSubConn(subConn)
+			ms.addSubConn(subConn)
+
+		}(conn)
+	}
 }
 
-// Accept waits for and returns the next MSocket.
 func (l *MTCPListener) Accept() (*MSocket, error) {
 	select {
 	case <-l.ctx.Done():
@@ -527,13 +472,11 @@ func (l *MTCPListener) Accept() (*MSocket, error) {
 	}
 }
 
-// Close closes the listener.
 func (l *MTCPListener) Close() error {
 	l.cancel()
 	return l.tcpListener.Close()
 }
 
-// Addr returns the listener's network address.
 func (l *MTCPListener) Addr() net.Addr {
 	return l.tcpListener.Addr()
 }
@@ -541,11 +484,17 @@ func (l *MTCPListener) Addr() net.Addr {
 //================================================================================
 // 管道和预连接池
 //================================================================================
+type pipeMode int
 
-// pipe connects two ReadWriteClosers, copying data between them until one closes.
+const (
+	TCP2MTCP pipeMode = iota
+	MTCP2TCP pipeMode = iota
+)
+
 func pipe(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
+
 	go func() {
 		defer wg.Done()
 		defer a.Close()
@@ -558,21 +507,20 @@ func pipe(a, b io.ReadWriteCloser) {
 		defer b.Close()
 		io.Copy(b, a)
 	}()
+
 	wg.Wait()
 }
 
-// PreConnPool manages a pool of pre-established connections.
 type PreConnPool struct {
 	poolChan    chan io.ReadWriteCloser
 	factory     func() (io.ReadWriteCloser, error)
 	maxSize     int
 	mu          sync.Mutex
-	currentSize int // Now correctly represents attempts in-flight + pooled
+	currentSize int
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
 
-// NewPreConnPool creates and maintains a new connection pool.
 func NewPreConnPool(factory func() (io.ReadWriteCloser, error), size int) *PreConnPool {
 	if size <= 0 {
 		return nil
@@ -589,15 +537,10 @@ func NewPreConnPool(factory func() (io.ReadWriteCloser, error), size int) *PreCo
 	return p
 }
 
-// [FIX] Corrected pool maintenance logic
+// maintain (FIXED): Corrected the pool state checking logic and simplified the loop.
 func (p *PreConnPool) maintain() {
-	// Initially, try to fill the pool
-	for i := 0; i < p.maxSize; i++ {
-		p.addConnection()
-	}
-
-	// Then, use a ticker to check and refill periodically
-	ticker := time.NewTicker(2 * time.Second) // Check less frequently
+	// The ticker now handles both initial fill and ongoing maintenance.
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -605,34 +548,23 @@ func (p *PreConnPool) maintain() {
 		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
-			p.addConnection()
+			p.mu.Lock()
+			// CORE FIX: The condition now correctly accounts for connections
+			// being created (currentSize) AND connections ready in the pool (len(poolChan)).
+			if p.currentSize+len(p.poolChan) < p.maxSize {
+				p.addConnection()
+			}
+			p.mu.Unlock()
 		}
 	}
 }
 
-// addConnection attempts to add one connection to the pool if needed.
-var (
-	addConnMu   sync.Mutex  // 防止同一个 PreConnPool 并发重试
-	nextRetryAt time.Time   // 记录下一次允许重试的时刻
-)
-
 func (p *PreConnPool) addConnection() {
-	addConnMu.Lock()
-	if time.Now().Before(nextRetryAt) {
-		addConnMu.Unlock()
-		return // 正在退避中，跳过
-	}
-	addConnMu.Unlock()
-
-	p.mu.Lock()
-	if p.currentSize >= p.maxSize {
-		p.mu.Unlock()
-		return
-	}
-	p.currentSize++
-	p.mu.Unlock()
-
 	go func() {
+		p.mu.Lock()
+		p.currentSize++
+		p.mu.Unlock()
+
 		defer func() {
 			p.mu.Lock()
 			p.currentSize--
@@ -641,52 +573,36 @@ func (p *PreConnPool) addConnection() {
 
 		conn, err := p.factory()
 		if err != nil {
-			// 指数退避：第一次 1 s，第二次 2 s，...，上限 30 s
-			backoff := 1 * time.Second
-			addConnMu.Lock()
-			if nextRetryAt.IsZero() {
-				nextRetryAt = time.Now().Add(backoff)
-			} else {
-				backoff = time.Until(nextRetryAt) * 2
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
-				nextRetryAt = time.Now().Add(backoff)
-			}
-			addConnMu.Unlock()
-			time.Sleep(backoff)
+			log.Printf("[PreConnPool] Failed to create pre-connection: %v", err)
+			time.Sleep(5 * time.Second)
 			return
 		}
-
-		// 成功就把退避清零
-		addConnMu.Lock()
-		nextRetryAt = time.Time{}
-		addConnMu.Unlock()
 
 		select {
 		case <-p.ctx.Done():
 			conn.Close()
+			return
 		case p.poolChan <- conn:
 			if debugLogEnabled {
-				log.Printf("[PreConnPool DEBUG] Added a new connection to the pool. Pool chan size: %d", len(p.poolChan))
+				log.Printf("[PreConnPool DEBUG] Added a new connection to the pool. Current size: %d", len(p.poolChan))
 			}
 		default:
+			// Pool is full, which can happen if multiple connections are created concurrently.
+			// Close the excess connection.
 			conn.Close()
 		}
 	}()
 }
 
-// Get retrieves a connection from the pool.
 func (p *PreConnPool) Get() (io.ReadWriteCloser, error) {
 	select {
 	case conn := <-p.poolChan:
 		return conn, nil
-	case <-time.After(3 * time.Second): // Slightly longer timeout
+	case <-time.After(5 * time.Second): // Increased timeout for getting a connection
 		return nil, errors.New("get connection from pool timed out")
 	}
 }
 
-// Close shuts down the pool and closes all its connections.
 func (p *PreConnPool) Close() {
 	p.cancel()
 	close(p.poolChan)
@@ -695,56 +611,28 @@ func (p *PreConnPool) Close() {
 	}
 }
 
-// Helper function to wait for an MSocket to become 'open'
-func waitForMSocketOpen(ctx context.Context, ms *MSocket) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if ms.readyState == "open" {
-				return nil
-			}
-			if ms.readyState == "closed" {
-				return errors.New("msocket closed while waiting to open")
-			}
-		}
-	}
-}
-
 // run: 启动管道服务 (已重构)
-func run(mode string, listenAddr, remoteAddr string, mPoolCount, preLinkCount int) {
-	// Step 1: Create pre-connection pool (if required)
+// run (FIXED): Simplified the factory function and new connection logic by using the now-blocking MSocket.Connect().
+func run(mode pipeMode, listenAddr, remoteAddr string, mPoolCount, preLinkCount int) {
+	// Step 1: 创建预连接池 (如果需要)
+	// 工厂函数现在根据模式创建不同类型的连接
 	var pool *PreConnPool
 	if preLinkCount > 0 {
 		log.Printf("Pre-connection pool enabled with size %d", preLinkCount)
-		var factory func() (io.ReadWriteCloser, error)
-
-		if mode == "client" {
-			// Client mode: pre-connect MSockets
-			factory = func() (io.ReadWriteCloser, error) {
+		factory := func() (io.ReadWriteCloser, error) {
+			if mode == TCP2MTCP {
+				// 客户端模式：预连接是 MSocket
 				remotes := strings.Split(remoteAddr, ",")
 				ms := NewMSocketClient(remotes, mPoolCount)
+				// Connect is now blocking, so no need for busy-waiting.
 				if err := ms.Connect(); err != nil {
-					return nil, err
-				}
-				// [FIX] Wait robustly for the connection to be ready
-				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-				defer cancel()
-				if err := waitForMSocketOpen(ctx, ms); err != nil {
-					ms.Close()
-					log.Printf("[PreConnPool Factory] MSocket connect timed out or failed: %v", err)
+					ms.Close() // Ensure cleanup on failure
 					return nil, err
 				}
 				return ms, nil
-			}
-		} else { // server mode
-			// Server mode: pre-connect plain TCP connections
-			factory = func() (io.ReadWriteCloser, error) {
-				
-				return net.DialTimeout("tcp", remoteAddr, 10*time.Second)
+			} else { // MTCP2TCP
+				// 服务端模式：预连接是普通 TCP
+				return net.Dial("tcp", remoteAddr)
 			}
 		}
 		pool = NewPreConnPool(factory, preLinkCount)
@@ -753,8 +641,9 @@ func run(mode string, listenAddr, remoteAddr string, mPoolCount, preLinkCount in
 		}
 	}
 
-	// Step 2: Start the appropriate listener and handling loop
-	if mode == "client" {
+	// Step 2: 根据模式启动不同的监听和处理循环
+	if mode == TCP2MTCP {
+		// 客户端模式: 监听 TCP, 连接到 MTCP
 		listener, err := net.Listen("tcp", listenAddr)
 		if err != nil {
 			log.Fatalf("Failed to listen on %s: %v", listenAddr, err)
@@ -776,36 +665,33 @@ func run(mode string, listenAddr, remoteAddr string, mPoolCount, preLinkCount in
 				if pool != nil {
 					upstreamConn, err = pool.Get()
 					if err != nil {
-						log.Printf("main.go:674: Failed to get MSocket from pool: %v. Creating a new one.", err)
+						log.Printf("Failed to get MSocket from pool: %v. Creating a new one.", err)
 					}
 				}
 
-				// [FIX] Robust fallback logic
 				if upstreamConn == nil {
 					remotes := strings.Split(remoteAddr, ",")
 					ms := NewMSocketClient(remotes, mPoolCount)
-					if err := ms.Connect(); err != nil {
-						log.Printf("Failed to initiate MSocket connection: %v", err)
-						downConn.Close()
-						return
-					}
-					ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-					defer cancel()
-					if err := waitForMSocketOpen(ctx, ms); err != nil {
-						log.Printf("Failed to establish fallback MSocket connection: %v", err)
+					// Connect is blocking, so the smelly sleep is gone.
+					if err = ms.Connect(); err == nil {
+						upstreamConn = ms
+					} else {
 						ms.Close()
-						downConn.Close()
-						return
 					}
-					upstreamConn = ms
 				}
 
-				log.Printf("main.go:693: Piping new TCP connection from %s to MTCP at %s", downConn.RemoteAddr(), remoteAddr)
+				if err != nil {
+					log.Printf("Failed to establish upstream MSocket connection: %v", err)
+					downConn.Close()
+					return
+				}
+				log.Printf("Piping new TCP connection from %s to MTCP at %s", downConn.RemoteAddr(), remoteAddr)
 				pipe(downConn, upstreamConn)
 			}(downstreamConn)
 		}
 
-	} else { // server mode
+	} else { // MTCP2TCP
+		// 服务端模式: 监听 MTCP, 连接到 TCP
 		listener, err := ListenMTCP(listenAddr)
 		if err != nil {
 			log.Fatalf("Failed to listen for MTCP on %s: %v", listenAddr, err)
@@ -832,17 +718,17 @@ func run(mode string, listenAddr, remoteAddr string, mPoolCount, preLinkCount in
 				}
 
 				if upstreamConn == nil {
-					
-					upstreamConn, err = net.DialTimeout("tcp", remoteAddr, 10*time.Second)
+					upstreamConn, err = net.Dial("tcp", remoteAddr)
 				}
 
 				if err != nil {
-					log.Printf("Failed to establish upstream TCP connection to %s: %v", remoteAddr, err)
+					log.Printf("Failed to establish upstream TCP connection: %v", err)
 					downConn.Close()
 					return
 				}
-				log.Printf("main.go:734: Piping new MTCP connection (ID: %d) to TCP at %s", downConn.cid, remoteAddr)
+				log.Printf("Piping new MTCP connection (ID: %d) to TCP at %s", downConn.cid, remoteAddr)
 				pipe(downConn, upstreamConn)
+
 			}(downstreamConn)
 		}
 	}
@@ -860,7 +746,7 @@ func main() {
 
 	serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
 	serverListen := serverCmd.String("l", "0.0.0.0:15201", "Listening address for MTCP")
-	serverRemote := serverCmd.String("r", "127.0.0.1:8080", "Upstream TCP service address")
+	serverRemote := serverCmd.String("r", "127.0.0.1:5201", "Upstream TCP service address")
 	serverPreLink := serverCmd.Int("pre", 0, "Pre-connection pool size (for mtcp to tcp)")
 
 	if len(os.Args) < 2 {
@@ -872,15 +758,15 @@ func main() {
 		return
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds) // Use microseconds for better timing analysis
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	switch os.Args[1] {
 	case "client":
 		clientCmd.Parse(os.Args[2:])
-		run("client", *clientListen, *clientRemote, *clientPool, *clientPreLink)
+		run(TCP2MTCP, *clientListen, *clientRemote, *clientPool, *clientPreLink)
 	case "server":
 		serverCmd.Parse(os.Args[2:])
-		run("server", *serverListen, *serverRemote, 0, *serverPreLink)
+		run(MTCP2TCP, *serverListen, *serverRemote, 0, *serverPreLink)
 	default:
 		fmt.Println("Expected 'client' or 'server' subcommands")
 		os.Exit(1)
