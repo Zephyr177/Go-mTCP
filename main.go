@@ -81,7 +81,7 @@ func NewMSocketServer(mid uint16) *MSocket {
 	return ms
 }
 
-// Connect (FIXED): Made blocking until the first sub-connection is established or a timeout occurs.
+// Connect: Made blocking until the first sub-connection is established or a timeout occurs.
 func (ms *MSocket) Connect() error {
 	if ms.isServer {
 		return errors.New("Connect() should only be called by a client MSocket")
@@ -482,7 +482,7 @@ func (l *MTCPListener) Addr() net.Addr {
 }
 
 //================================================================================
-// 管道和预连接池
+// 管道工具
 //================================================================================
 type pipeMode int
 
@@ -511,137 +511,8 @@ func pipe(a, b io.ReadWriteCloser) {
 	wg.Wait()
 }
 
-type PreConnPool struct {
-	poolChan    chan io.ReadWriteCloser
-	factory     func() (io.ReadWriteCloser, error)
-	maxSize     int
-	mu          sync.Mutex
-	currentSize int
-	ctx         context.Context
-	cancel      context.CancelFunc
-}
-
-func NewPreConnPool(factory func() (io.ReadWriteCloser, error), size int) *PreConnPool {
-	if size <= 0 {
-		return nil
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	p := &PreConnPool{
-		poolChan: make(chan io.ReadWriteCloser, size),
-		factory:  factory,
-		maxSize:  size,
-		ctx:      ctx,
-		cancel:   cancel,
-	}
-	go p.maintain()
-	return p
-}
-
-// maintain (FIXED): Corrected the pool state checking logic and simplified the loop.
-func (p *PreConnPool) maintain() {
-	// The ticker now handles both initial fill and ongoing maintenance.
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-p.ctx.Done():
-			return
-		case <-ticker.C:
-			p.mu.Lock()
-			// CORE FIX: The condition now correctly accounts for connections
-			// being created (currentSize) AND connections ready in the pool (len(poolChan)).
-			if p.currentSize+len(p.poolChan) < p.maxSize {
-				p.addConnection()
-			}
-			p.mu.Unlock()
-		}
-	}
-}
-
-func (p *PreConnPool) addConnection() {
-	go func() {
-		p.mu.Lock()
-		p.currentSize++
-		p.mu.Unlock()
-
-		defer func() {
-			p.mu.Lock()
-			p.currentSize--
-			p.mu.Unlock()
-		}()
-
-		conn, err := p.factory()
-		if err != nil {
-			log.Printf("[PreConnPool] Failed to create pre-connection: %v", err)
-			time.Sleep(5 * time.Second)
-			return
-		}
-
-		select {
-		case <-p.ctx.Done():
-			conn.Close()
-			return
-		case p.poolChan <- conn:
-			if debugLogEnabled {
-				log.Printf("[PreConnPool DEBUG] Added a new connection to the pool. Current size: %d", len(p.poolChan))
-			}
-		default:
-			// Pool is full, which can happen if multiple connections are created concurrently.
-			// Close the excess connection.
-			conn.Close()
-		}
-	}()
-}
-
-func (p *PreConnPool) Get() (io.ReadWriteCloser, error) {
-	select {
-	case conn := <-p.poolChan:
-		return conn, nil
-	case <-time.After(5 * time.Second): // Increased timeout for getting a connection
-		return nil, errors.New("get connection from pool timed out")
-	}
-}
-
-func (p *PreConnPool) Close() {
-	p.cancel()
-	close(p.poolChan)
-	for conn := range p.poolChan {
-		conn.Close()
-	}
-}
-
-// run: 启动管道服务 (已重构)
-// run (FIXED): Simplified the factory function and new connection logic by using the now-blocking MSocket.Connect().
-func run(mode pipeMode, listenAddr, remoteAddr string, mPoolCount, preLinkCount int) {
-	// Step 1: 创建预连接池 (如果需要)
-	// 工厂函数现在根据模式创建不同类型的连接
-	var pool *PreConnPool
-	if preLinkCount > 0 {
-		log.Printf("Pre-connection pool enabled with size %d", preLinkCount)
-		factory := func() (io.ReadWriteCloser, error) {
-			if mode == TCP2MTCP {
-				// 客户端模式：预连接是 MSocket
-				remotes := strings.Split(remoteAddr, ",")
-				ms := NewMSocketClient(remotes, mPoolCount)
-				// Connect is now blocking, so no need for busy-waiting.
-				if err := ms.Connect(); err != nil {
-					ms.Close() // Ensure cleanup on failure
-					return nil, err
-				}
-				return ms, nil
-			} else { // MTCP2TCP
-				// 服务端模式：预连接是普通 TCP
-				return net.Dial("tcp", remoteAddr)
-			}
-		}
-		pool = NewPreConnPool(factory, preLinkCount)
-		if pool != nil {
-			defer pool.Close()
-		}
-	}
-
-	// Step 2: 根据模式启动不同的监听和处理循环
+// run: 启动管道服务 (已移除预连接池)
+func run(mode pipeMode, listenAddr, remoteAddr string, mPoolCount int) {
 	if mode == TCP2MTCP {
 		// 客户端模式: 监听 TCP, 连接到 MTCP
 		listener, err := net.Listen("tcp", listenAddr)
@@ -662,22 +533,13 @@ func run(mode pipeMode, listenAddr, remoteAddr string, mPoolCount, preLinkCount 
 				var upstreamConn io.ReadWriteCloser
 				var err error
 
-				if pool != nil {
-					upstreamConn, err = pool.Get()
-					if err != nil {
-						log.Printf("Failed to get MSocket from pool: %v. Creating a new one.", err)
-					}
-				}
-
-				if upstreamConn == nil {
-					remotes := strings.Split(remoteAddr, ",")
-					ms := NewMSocketClient(remotes, mPoolCount)
-					// Connect is blocking, so the smelly sleep is gone.
-					if err = ms.Connect(); err == nil {
-						upstreamConn = ms
-					} else {
-						ms.Close()
-					}
+				// 动态创建新的 MSocket 连接
+				remotes := strings.Split(remoteAddr, ",")
+				ms := NewMSocketClient(remotes, mPoolCount)
+				if err = ms.Connect(); err == nil {
+					upstreamConn = ms
+				} else {
+					ms.Close()
 				}
 
 				if err != nil {
@@ -685,6 +547,7 @@ func run(mode pipeMode, listenAddr, remoteAddr string, mPoolCount, preLinkCount 
 					downConn.Close()
 					return
 				}
+
 				log.Printf("Piping new TCP connection from %s to MTCP at %s", downConn.RemoteAddr(), remoteAddr)
 				pipe(downConn, upstreamConn)
 			}(downstreamConn)
@@ -710,25 +573,17 @@ func run(mode pipeMode, listenAddr, remoteAddr string, mPoolCount, preLinkCount 
 				var upstreamConn io.ReadWriteCloser
 				var err error
 
-				if pool != nil {
-					upstreamConn, err = pool.Get()
-					if err != nil {
-						log.Printf("Failed to get TCP conn from pool: %v. Creating a new one.", err)
-					}
-				}
-
-				if upstreamConn == nil {
-					upstreamConn, err = net.Dial("tcp", remoteAddr)
-				}
+				// 动态创建新的上游 TCP 连接
+				upstreamConn, err = net.Dial("tcp", remoteAddr)
 
 				if err != nil {
 					log.Printf("Failed to establish upstream TCP connection: %v", err)
 					downConn.Close()
 					return
 				}
+
 				log.Printf("Piping new MTCP connection (ID: %d) to TCP at %s", downConn.cid, remoteAddr)
 				pipe(downConn, upstreamConn)
-
 			}(downstreamConn)
 		}
 	}
@@ -742,12 +597,10 @@ func main() {
 	clientListen := clientCmd.String("l", "127.0.0.1:5201", "Local listening address (TCP)")
 	clientRemote := clientCmd.String("r", "8.8.8.8:15201", "Remote MTCP server address. Use comma to aggregate multi-line, e.g., 'ip1:port,ip2:port'")
 	clientPool := clientCmd.Int("p", 3, "Sub-connection count for each MTCP link")
-	clientPreLink := clientCmd.Int("pre", 10, "Pre-connection pool size")
 
 	serverCmd := flag.NewFlagSet("server", flag.ExitOnError)
 	serverListen := serverCmd.String("l", "0.0.0.0:15201", "Listening address for MTCP")
 	serverRemote := serverCmd.String("r", "127.0.0.1:5201", "Upstream TCP service address")
-	serverPreLink := serverCmd.Int("pre", 0, "Pre-connection pool size (for mtcp to tcp)")
 
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: program <client|server> [options]")
@@ -763,10 +616,10 @@ func main() {
 	switch os.Args[1] {
 	case "client":
 		clientCmd.Parse(os.Args[2:])
-		run(TCP2MTCP, *clientListen, *clientRemote, *clientPool, *clientPreLink)
+		run(TCP2MTCP, *clientListen, *clientRemote, *clientPool)
 	case "server":
 		serverCmd.Parse(os.Args[2:])
-		run(MTCP2TCP, *serverListen, *serverRemote, 0, *serverPreLink)
+		run(MTCP2TCP, *serverListen, *serverRemote, 0)
 	default:
 		fmt.Println("Expected 'client' or 'server' subcommands")
 		os.Exit(1)
