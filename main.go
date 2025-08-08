@@ -611,11 +611,23 @@ func (p *PreConnPool) maintain() {
 }
 
 // addConnection attempts to add one connection to the pool if needed.
+var (
+	addConnMu   sync.Mutex  // 防止同一个 PreConnPool 并发重试
+	nextRetryAt time.Time   // 记录下一次允许重试的时刻
+)
+
 func (p *PreConnPool) addConnection() {
+	addConnMu.Lock()
+	if time.Now().Before(nextRetryAt) {
+		addConnMu.Unlock()
+		return // 正在退避中，跳过
+	}
+	addConnMu.Unlock()
+
 	p.mu.Lock()
 	if p.currentSize >= p.maxSize {
 		p.mu.Unlock()
-		return // Pool is full or has enough attempts in flight
+		return
 	}
 	p.currentSize++
 	p.mu.Unlock()
@@ -627,27 +639,38 @@ func (p *PreConnPool) addConnection() {
 			p.mu.Unlock()
 		}()
 
-		// Try to create a connection using the factory
 		conn, err := p.factory()
 		if err != nil {
-			// Don't log here, factory is responsible for logging its failures
-			// Just sleep before allowing another attempt for this slot
-			time.Sleep(5 * time.Second)
+			// 指数退避：第一次 1 s，第二次 2 s，...，上限 30 s
+			backoff := 1 * time.Second
+			addConnMu.Lock()
+			if nextRetryAt.IsZero() {
+				nextRetryAt = time.Now().Add(backoff)
+			} else {
+				backoff = time.Until(nextRetryAt) * 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				nextRetryAt = time.Now().Add(backoff)
+			}
+			addConnMu.Unlock()
+			time.Sleep(backoff)
 			return
 		}
 
-		// Try to add the connection to the pool
+		// 成功就把退避清零
+		addConnMu.Lock()
+		nextRetryAt = time.Time{}
+		addConnMu.Unlock()
+
 		select {
 		case <-p.ctx.Done():
-			conn.Close() // Pool is closing
-			return
+			conn.Close()
 		case p.poolChan <- conn:
 			if debugLogEnabled {
 				log.Printf("[PreConnPool DEBUG] Added a new connection to the pool. Pool chan size: %d", len(p.poolChan))
 			}
 		default:
-			// Pool is full, this can happen if multiple goroutines succeed at once.
-			// Just close the extra connection.
 			conn.Close()
 		}
 	}()
