@@ -204,8 +204,11 @@ func (ms *MSocket) readLoop(subConn *mSubConn) {
 	defer func() {
 		subConn.Close()
 		ms.connsMutex.Lock()
-		// Remove the connection from the active list
-		newConns := make([]*mSubConn, 0, len(ms.conns)-1)
+		
+		// BUG修复：在从 ms.conns 移除断开的连接时，必须处理并发场景。
+		// 直接遍历并构建一个新的切片是最安全的方式，可以避免在 len(ms.conns) 为0或1时，
+		// 计算 newConns 容量 (len-1) 时出现负数，从而引发 panic。
+		newConns := make([]*mSubConn, 0, len(ms.conns))
 		for _, c := range ms.conns {
 			if c != subConn {
 				newConns = append(newConns, c)
